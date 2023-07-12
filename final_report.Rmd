@@ -1,0 +1,1377 @@
+---
+title: "Vancouver Housing Report"
+author: "Pascal Schmidt"
+date: "2023-03-10"
+header-includes: 
+- \usepackage{float} 
+- \floatplacement{Figure}{H} 
+output:
+  pdf_document:
+    keep_tex: true
+    extra_dependencies: ["flafter"]
+    fig_cap: yes
+    toc: true
+    number_sections: true
+urlcolor: blue
+---
+
+\newpage
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+
+library(tidyverse)
+library(knitr)
+library(tidymodels)
+library(sf)
+library(DiagrammeR)
+library(corrplot)
+library(ggmap)
+library(vip)
+library(mgcv)
+library(earth)
+library(caret)
+library(pdp)
+library(doFuture)
+library(parallel)
+
+set.seed(1234)
+
+config <- config::get()
+# Set your API Key
+ggmap::register_google(key = config$maps_api_key)
+
+# utility function to improve layout of tables
+format_table_numbers <- function(table, column_name, column_value) {
+  table %>%
+    dplyr::mutate(
+      !!column_value := dplyr::case_when(
+        !!sym(column_name) %in% c("rmse", "mae") ~ scales::dollar(!!sym(column_value)),
+        !!sym(column_name) == "rsq" ~ scales::percent(!!sym(column_value), accuracy = 0.01),
+        !!sym(column_name) == "mape" ~ scales::percent(round(!!sym(column_value) / 100, 4), accuracy = 0.01)
+      )
+    )
+}
+```
+
+# Introduction and Research Question
+
+Housing is an area of life that is affecting everyone. With an ever-changing economy and increasing interest rates, it is difficult to price properties accurately. Therefore, I was interested in analyzing the Vancouver real estate market and predicting the listing price of a property. This lets interested buyers and sellers in the Vancouver market know what they can roughly expect a home will cost when trying to buy or sell a property. To answer this research question I scraped data from real estate websites and feature engineered variables with the Google Maps API and publicly available data sets. I then used a random forest model and a gradient-boosted decision tree to predict the listing price of a home. 
+
+# Data Acquisition
+
+## Introduction
+
+It is important to have the right predictor variables that explain the variation in property prices well. Therefore, I looked for a variety of websites that allowed me to scrape their data. One reason to scrape from multiple websites was to increase the sample size of my data and another reason was to reduce the selection bias of home prices. This eliminates the chance of scraping homes from websites that only list, for example, luxury homes or only homes from certain neighborhoods in Vancouver. Also, maybe only certain agents list properties on certain websites and there is a variation in how much a property costs, based on a property agent.
+
+On top of scraping data from the web, I also augmented my existing data set with publicly available data from the City of Vancouver, the police department, and the public transit website from Vancouver. This allowed me to get information about public schools, parks, restaurants and bars, crime rates, and bus and train stations. In addition to these data sources, I also used the Google Maps API to get latitude and longitude values for all the properties I scraped, by providing the API with the scraped property addresses. To accomplish this I created API credentials on the [Google Cloud Platform](https://cloud.google.com/products) to access the geocoding functionality. I then used the `googleway` package to send addresses to the API and got back latitude and longitude values for the properties I scraped. 
+
+## Web Scraping Details
+
+In total, I scraped rental prices and property prices from six different real estate websites. Table 1 shows the websites. Point 2 Homes, Remax, Rew, and Zolo provided data for property prices and Craigslist and Live.Rent provided rentals rates.  
+
+```{r}
+dplyr::tibble(
+  `Property Listing Websites` = c("Point 2 Homes", "Remax", "Rew", "Zolo"),
+  `Rental Listing Websites` = c("Craigslist", "Liv.rent", "", "")
+) %>%
+  dplyr::mutate(
+    `Property Listing Websites` = dplyr::case_when(
+      `Property Listing Websites` == "Point 2 Homes" ~ paste0(
+        "[", `Property Listing Websites`, "]", "(https://www.point2homes.com/CA/Real-Estate-Listings/BC/Vancouver.html)"
+      ),
+      `Property Listing Websites` == "Remax" ~ paste0(
+        "[", `Property Listing Websites`, "]", "(https://www.remax.ca/bc/vancouver-real-estate?pageNumber=1)"
+      ),
+      `Property Listing Websites` == "Rew" ~ paste0(
+        "[", `Property Listing Websites`, "]", "(https://www.rew.ca/properties/areas/vancouver-bc)"
+      ),
+      `Property Listing Websites` == "Zolo" ~ paste0(
+        "[", `Property Listing Websites`, "]", "(https://www.zolo.ca/vancouver-real-estate)"
+      )
+    ),
+    `Rental Listing Websites` = dplyr::case_when(
+      `Rental Listing Websites` == "Craigslist" ~ paste0(
+        "[", `Rental Listing Websites`, "]", "(https://vancouver.craigslist.org/search/apa?query=Vancouver#search=1~gallery~0~0)"
+      ),
+      `Rental Listing Websites` == "Liv.rent" ~ paste0(
+        "[", `Rental Listing Websites`, "]", "(https://liv.rent/rental-listings/city/vancouver)"
+      ),
+      TRUE ~ ""
+    )
+  ) %>%
+  knitr::kable(caption = "Scraped Websites")
+```
+
+A big challenge of scraping multiple data sources was to obtain common predictors from all websites. Point 2 home, Rew, and Zolo had data about lot sizes but Remax did not. So I decided to exclude properties of type single family home from Remax and only included apartments and condos that had no lot size. Another trade-off I made when combining different data sources was to exclude the year a house was built. Some of the websites I scraped did not include this information while others did. Ultimately, I decided to include more observations in my sample from different data sources rather than deleting observations that did not have the predictor for when a property was built.
+
+For dynamic websites, I used the `RSelenium` package in combination with a Docker container to scrape real estate listings. For static websites, I used the `rvest` package. 
+
+For each website, I created two web scraping functions. One function scrapes all the links that point to the individual property website and a second one visits the scraped links and scrapes all the necessary information for a property. I started scraping websites in late January and periodically scraped data until late March. When I was re-running the web scraping functions I excluded links that were scraped in the past.
+
+Table 2 shows all the variables scraped from the websites that are listed in Table 1.
+
+```{r}
+dplyr::tibble(
+  `Variables From Web Scraping` = c(
+    "Price", "# of Bedrooms", "# of Bathrooms", "# of Square Feet",
+    "Lot Size in Square Feet", "Address", "Type of Home"
+  )
+) %>% knitr::kable(caption = "Variables Scraped From Websites")
+```
+
+## Public Places Details
+
+In addition to the variables obtained from web scraping, I also visited the City of Vancouver website to find data sets and variables that are useful to predict the price of a property. In particular, I acquired data sets about [schools](https://opendata.vancouver.ca/explore/dataset/schools/table/), [parks](https://opendata.vancouver.ca/explore/dataset/parks-polygon-representation/table/), [places](https://opendata.vancouver.ca/explore/dataset/storefronts-inventory/table/) such as grocery stores, restaurants, coffee shops, and public service places. Each of these data sets had latitude and longitude values included. 
+
+I also was interested in finding out about public transit stations. I found information about bus stops and sky train stations on the official [Translink]((https://www.translink.ca/about-us/doing-business-with-translink/app-developer-resources/gtfs/gtfs-data)) website where I used the `stops.txt` file for information about bus stops and sky train stops in Vancouver. The stops had latitude and longitude associated with them.
+
+For the schools, parks, and transit stations, I calculated the shortest distance from a property to these places. For restaurants, coffee shops, convenience stores, and commercial services, I calculated how many of these places are in a 500m radius around the home. To calculate the distances, I connected to the Google Maps API and used the address I scraped to get back latitude and longitude values. I used the coordinates from the property and also the coordinates from the public places to calculate the distances. I also used the latitude and longitude values from the Google Maps API as predictors in my model. 
+
+In addition to the public places, I also visited the website for the [Vancouver police department](https://geodash.vpd.ca/opendata/) and downloaded crime rates by neighborhood and crime type. Unfortunately, due to privacy reasons, no latitude and longitude values were provided. However, addresses for intersections and blocks were provided. I added latitude and longitude values with the help of the Google Maps API and then summarized the number of crimes by neighborhood and crime type and added it to the existing data frame. 
+
+I was also interested in finding out the neighborhood of a home. Some of the websites I scraped did not list the neighborhood of a property. Therefore, I downloaded a shape file from the City of Vancouver [open data portal](https://opendata.vancouver.ca/explore/dataset/local-area-boundary/table/?disjunctive.name) that includes polygon data about all neighborhoods in Vancouver. I then calculated if a coordinate falls within a polygon and added a neighborhood column to my data set.
+
+## Sample Size
+
+In total, I scraped around ~20,000 observations from real estate websites. Around 1/3 of the observations come from rentals and 2/3 of observations come from property prices. The information I was scraping from the websites were the address of the home, number of bathrooms, number of bedrooms, number of square feet, the type of the home (condo, duplex, single-family home, etc), the lot size, and the price of the home. 
+
+Figure 1 shows a flow chart of the sample size. I am starting with 20,000 observations which are the raw data. After collecting latitude and longitude values with the help of the Google Maps API there are around 18,200 observations left. This is either because the web scraper failed to scrape the address properly or because Google gave back an address that is not exact. With each API call, Google sends back the location type. If the location type was not `ROOFTOP` or `APPROXIMATE`, observations were deleted.
+
+Sometimes, web scrapers failed to scrape the necessary predictors, listed in Table 1, from the websites or some websites had missing information. This is particularly true for a website such as craigslist where users input the data and often leave out information. Therefore, all observations that had one or more predictors missing from Table 1 were deleted. This resulted in 14,000 observations.
+
+Next, only observations from Vancouver neighborhoods were considered. Originally, also properties in the Greater Vancouver area were considered such as Burnaby, Richmond, Surrey, and North Vancouver. However, due to more data collection efforts such as public places and the increase in API calls, which is costly, I decided to only focus on the Vancouver neighborhoods. After intersecting the latitude and longitude data with the polygon regions obtained from the City of Vancouver and excluding properties worth \$10 million or more, only around 7,000 observations were left. I excluded properties worth \$10 Million or more because there were too few observations in that price range. The Appendix Table 11 shows all the neighborhoods that were considered and Figure 21 shows how many properties are present in each neighborhood. 
+
+```{r sample-size, fig.cap="Sample Size Flow Chart"}
+grViz(
+  "digraph flowchart {
+      # node definitions with substituted label text
+      node [fontname = Helvetica, shape = rectangle]
+      tab1 [label = '@@1']
+      tab2 [label = '@@2']
+      tab3 [label = '@@3']
+      tab4 [label = '@@4']
+      tab5 [label = '@@5']
+      tab6 [label = '@@6']
+
+      # edge definitions with the node IDs
+      tab1 -> tab2;
+      tab2 -> tab3;
+      tab3 -> tab4;
+      tab4 -> tab5;
+      tab4 -> tab6;
+      }
+
+      [1]: 'Scraped homes from the Greater Vancouver real estate market from 6 websites n = ~20,000'
+      [2]: 'Augmented data with the Google Maps API and removed missing lat lon values n = ~18,200'
+      [3]: 'Removed rows with missing values for predictors n = ~14,000'
+      [4]: 'Only included observation that are located in the Vancouver neighborhoods and are below $10 Million n = ~7,000'
+      [5]: 'Rental Sample n = ~3,000'
+      [6]: 'Home Sample n = ~4,000'
+      "
+)
+```
+
+## Data Storage
+
+Figure 2 shows the data storage process. Because I was web scraping data periodically I created one parquet file for each website and day when I was scraping. This resulted in around 5-6 parquet files for each website that included the raw data from late January to late March. After I scraped data from the websites listed in Table 1, I did some pre-cleaning steps that were unique to each scraped website. Such cleaning steps involved coercing character strings into numeric data types, lumping levels together for categorical predictors and merging columns when the same information was distributed across multiple columns. On top of that I also removed unnecessary variables for example when a property was built, the property description, home features, and if pets were allowed or not. 
+
+I used one folder for every website I scraped. I created parquet files every time I was scraping data and the file was named according to the date I obtained the data. In addition to the cleaning steps, I also feature engineered latitude and longitude values for each property. After the cleaning steps and data augmentation step I created a new folder and split all the data into separate parquet files by the date it was collected. 
+
+Figure 22 in the Appendix explains what R functions and scripts were used from scraping the data to creating the final data set. 
+
+```{r fig.cap="Data Storage Flow Chart"}
+grViz(
+  diagram = "digraph flowchart {
+      # node definitions with substituted label text
+      node [fontname = Helvetica, shape = rectangle]
+      tab1 [label = '@@1', fontsize = 60]
+      tab2 [label = '@@2', fontsize = 35]
+      tab3 [label = '@@3', fontsize = 35]
+      tab4 [label = '@@4', fontsize = 35]
+      tab5 [label = '@@5', fontsize = 35]
+      tab6 [label = '@@6', fontsize = 35]
+      tab7 [label = '@@7', fontsize = 60]
+      tab8 [label = '@@8', fontsize = 60]
+      tab9 [label = '@@9', fontsize = 35]
+      tab10 [label = '@@10', fontsize = 35]
+      tab11 [label = '@@11', fontsize = 35]
+      tab12 [label = '@@12', fontsize = 35]
+      tab13 [label = '@@13', fontsize = 35]
+
+      ranksep = 2;
+
+      # edge definitions with the node IDs
+      tab1 -> tab2;
+      tab1 -> tab3;
+      tab1 -> tab4;
+      tab1 -> tab5;
+      tab1 -> tab6;
+
+      tab2 -> tab7;
+      tab3 -> tab7;
+      tab4 -> tab7;
+      tab5 -> tab7;
+      tab6 -> tab7;
+
+      tab7 -> tab8;
+
+      tab8 -> tab9;
+      tab8 -> tab10;
+      tab8 -> tab11;
+      tab8 -> tab12;
+      tab8 -> tab13;
+  }
+
+      [1]: 'Individual website folder'
+      [2]: 'Raw data file 2023-01-27.parquet'
+      [3]: 'Raw data file 2023-02-12.parquet'
+      [4]: 'Raw data file 2023-02-26.parquet'
+      [5]: 'Raw data file 2023-03-08.parquet'
+      [6]: 'Raw data file 2023-03-24.parquet'
+      [7]: 'Cleaning data + augmenting latituded and longitude values'
+      [8]: 'Augmented data folder'
+      [9]: 'Augmented data file 2023-03-24.parquet'
+      [10]: 'Augmented data file 2023-02-12.parquet'
+      [11]: 'Augmented data file 2023-02-26.parquet'
+      [12]: 'Augmented data file 2023-03-08.parquet'
+      [13]: 'Augmented data file 2023-03-24.parquet'
+      "
+)
+```
+
+## Data Cleaning
+
+Figure 3 shows the steps of how the final data was obtained. After the initial pre-cleaning and data augmentation steps, I combined all parquet files that live in the augmented data folder. Each website folder has such a data folder with around 5-6 parquet files. In total there are around 30 different parquet files with the pre-cleaned data and augmented latitude and longitude values. I then read in all 30 parquet files and stacked them on top of each other by row binding them. In the process I standardized the column names, created new variable that indicated whether the data comes from a rental website or property price website, and standardized the property type levels. Afterwards, I removed missing values and added the neighborhoods to the data frame. In addition to that I also calculated the distances from properties to the public places and bus and train stations, and calculated the number of restaurants and bars and public service places that fall within a 500 meter radius around a property. I also added the number of crimes that happened in 2021 in each neighborhood to the data set. 
+
+```{r fig.cap="Data Cleaning Process Flow Chart"}
+grViz(
+  diagram = "digraph flowchart {
+      # node definitions with substituted label text
+      node [fontname = Helvetica, shape = rectangle]
+      tab1 [label = '@@1']
+      tab2 [label = '@@2']
+      tab3 [label = '@@3']
+      tab4 [label = '@@4']
+      tab5 [label = '@@5']
+      tab6 [label = '@@6']
+      tab7 [label = '@@7']
+      tab8 [label = '@@8']
+
+      ranksep = 1;
+
+      # edge definitions with the node IDs
+      tab1 -> tab5;
+      tab2 -> tab5;
+      tab3 -> tab5;
+      tab4 -> tab5;
+      tab5 -> tab6;
+      tab6 -> tab7;
+      tab7 -> tab8;
+  }
+
+      [1]: 'Augmented data folder Craigslist'
+      [2]: 'Augmented data folder Point 2 home'
+      [3]: '...'
+      [4]: 'Augmented data folder Zumper'
+      [5]: 'Combined data with augmented latitude and longituded values'
+      [6]: 'Cleaning combined data source and removed missing values'
+      [7]: 'Added neighbourhoods and public places preddictors'
+      [8]: 'Final data set for model building'
+      "
+)
+```
+
+# Final Data Set
+
+After applying all the filtering steps in the flow chart above I ended up with around 4000 observations for home prices and 3000 observations for rental prices.  
+
+The predictor variables and their mode are in Table 3. When the property type is apartment, the lot size will be zero. A more detailed summary statistics table of all the predictor and response variables can be found in Table 12 in the Appendix.
+
+```{r echo=FALSE}
+dplyr::tibble(
+  `Variables From Web Scraping` = c(
+    "Price", "# of Bedrooms", "# of Bathrooms", "# of Square Feet",
+    "Lot Size in Square Feet", "Latitude", "Longitude", "Closest School (in meters)",
+    "Closest Park (in meters)", "Closest Bus Stop (in meters)",
+    "Closest Sky Train Station (in meters)", "# of Restaurants/Coffee Shops within 500 meters",
+    "# of Commercial Services within 500 meters", "# of Convenience Stores within 500 meters",
+    "# of Break and Enter Commercial \n within neighborhood",
+    "# of Break and Enter Residential/Other \n within neighborhood",
+    "# of Mischief within neighborhood", " # Other Theft within neighborhood",
+    "# Theft from Vehicle within neighborhood", "# Theft of Bicycle within neighborhood",
+    "# Theft of Vehicle within neighborhood",
+    "# Vehicle Collision or Pedestrian Struck (with Injury) \n within neighborhood",
+    "Type of Home", "Neighborhood", "Websites"
+  ),
+  Mode = c(rep("Continuous", 22), "Categorical", "Categorical", "Categorical")
+) %>% knitr::kable(caption = "Final Predictor Variables")
+```
+
+# Exploratory Data Analysis
+
+```{r echo=FALSE, fig.cap="Choropleth Map Number of Properties in Neighbourhoods", fig.height=5}
+df_augmented <- readr::read_csv(here::here("data/report_data/df1.rds"))
+df <- readr::read_csv(
+  here::here(
+    "data/analysis/df.csv"
+  )
+)
+
+df <- df %>%
+  dplyr::filter(
+    rent_buy == "buy", !is.na(type), type != "2 BedsBds",
+    type != "Triplex" & type != "Other",
+    square_feet >= 300, price <= 10000000
+  ) %>%
+  dplyr::mutate(
+    type = ifelse(type == "House with Acreage", "House", type)
+  ) %>%
+  dplyr::select(
+    square_feet, price, beds, baths, type, lot_size, neighborhood,
+    lng, lat, sky_train, bus_stop, parks, schools, commercial_services,
+    food_beverages, food_beverages, website,
+    break_and_enter_commercial:vehicle_collision_or_pedestrian_struck_with_injury
+  )
+
+homes_df_summarized <- df %>%
+  dplyr::group_by(neighborhood) %>%
+  dplyr::summarise(
+    n = dplyr::n()
+  ) %>%
+  dplyr::ungroup()
+
+# vancouver map boundaries, shape file
+boundaries <- read_sf("data/augmentation_data/local-area-boundary.shp")
+homes_df <- homes_df_summarized %>%
+  dplyr::inner_join(
+    boundaries,
+    by = c("neighborhood" = "name")
+  ) %>%
+  sf::st_as_sf()
+
+# ggplot(data = homes_df) +
+#   geom_sf() +
+#   geom_sf(aes(fill = n)) +
+#   scale_fill_viridis_c(trans = "sqrt", alpha = .4) +
+#   coord_sf(xlim = c(-123, -123.25), ylim = c(49.18, 49.3)) +
+#   theme_minimal() +
+#   theme(
+#     legend.position = "bottom",
+#     legend.key.width = unit(3, 'cm')
+#   )
+```
+
+## Vancouver Map and Property Distribution by Type and Coloured by Price 
+
+Figure 4 shows a scatterplot by property type and colored by price. The most expensive properties are of type house and are located in West Vancouver. Most of the properties are either apartments or houses. Most apartments are located in the Downtown area and houses are more randomly distributed across the Vancouver neighborhoods. 
+
+```{r fig.cap="Density Plot of Price by Proprty Type", fig.width = 12, fig.height = 8, fig.align='center'}
+p <- ggmap(
+  get_googlemap(
+    center = c(lon = -123.11, lat = 49.25),
+    zoom = 12, scale = 2,
+    maptype = "terrain",
+    color = "color"
+  )
+)
+
+p + geom_point(
+  data = df,
+  aes(x = lng, y = lat, col = price),
+  alpha = 0.4, size = 3
+) +
+  facet_wrap(~type) +
+  theme(
+    legend.position = "bottom",
+    legend.key.width = unit(4, "cm"),
+    axis.text = element_text(size = 12),
+    axis.title = element_text(size = 14),
+    legend.text = element_text(size = 14),
+    legend.title = element_text(size = 16),
+    strip.text.x = element_text(size = 12)
+  ) +
+  scale_colour_gradientn(colours = terrain.colors(10)) +
+  scale_x_continuous(labels = scales::label_number(accuracy = 0.01)) +
+  labs(color = "Home Price") +
+  xlab("Longitude") +
+  ylab("Latitude")
+
+# ggsave("facet_map.png", bg = "white", width = 8, height = 7)
+# knitr::include_graphics("facet_map.png")
+```
+
+## Correlation Matrix
+
+Figure 5 shows a correlation matrix of the response variable, price, and all other predictors. Longitude is negatively correlated with price. The higher the price of a property, the less the longitude of a property. This is in correspondents with Figure 4. The most expensive homes are located in West Vancouver and therefore, there is a negative correlation between price and longitude.
+
+It is interesting to see that there is a negative correlation between price and the number of restaurants and bars and commercial services near a property. One would think that the more restaurants are near by a property, the higher the value of a home. 
+
+It is also worth noting that there is a positive relationship between the distance of train stations, bus stations, schools, and parks to a property. The longer the distance is to these places, the higher the price of a home. 
+
+The negative correlation between crime rates and property prices is expected. The more crime there is near a property, the lower the price of the property.
+
+There also is a very high correlation between the number of square feet, number of baths, number of beds, and the size of the lot of a home to the price.
+
+```{r fig.cap="Correlation Matrix Between the Response Variable and Predictors"}
+df %>%
+  dplyr::select_if(is.numeric) %>%
+  cor() %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column(var = "variables") %>%
+  dplyr::filter(variables == "price") %>%
+  dplyr::select(-price) %>%
+  purrr::set_names(
+    c(
+      "Price", "Square Feet", "Beds", "Baths", "Lot Size", "Longitude", "Latitude",
+      "Sky Train", "Bus Stop", "Parks", "Schools", "Commercial Services",
+      "Restaurants & Bars", "Commercial Crimes", "Residential Crimes", "Mischief",
+      "Other Theft", "Vehicle Theft", "Bicycle Theft", "Theft of Vehicle", "Road Accidents"
+    )
+  ) %>%
+  tibble::column_to_rownames(var = "Price") -> temp
+
+par(mfrow = c(1, 2))
+corrplot::corrplot(
+  t(as.matrix(temp[, 1:10])),
+  method = "number",
+  cl.pos = "n", tl.col = "black", number.cex = .7
+)
+corrplot::corrplot(
+  t(as.matrix(temp[, 11:length(temp)])),
+  method = "number", cl.pos = "n", tl.col = "black", number.cex = .7
+)
+```
+
+## Deep Dive Into Correlations 
+
+Figure 6 shows that there are different relationships between the price of a property and how many commercial services are near a home, by property type. The higher the number of commercial services near a house, the less that property is worth. In contrast, there does not seem to be a relationship for other property types. However, for apartments, the price of a property increases if there are more than 200 commercial services near by. 
+
+```{r fig.cap="Scattreplot of Price and Commercial Services by Property Type", fig.height=4, fig.width=7}
+df %>%
+  ggplot(aes(x = commercial_services, y = price)) +
+  geom_point() +
+  geom_smooth() +
+  scale_y_log10(label = scales::dollar_format()) +
+  facet_wrap(~type) +
+  theme_minimal() +
+  ylab("Price") +
+  xlab("Number of Commercial Services Near a Properety")
+```
+
+Similarly, Figure 7 shows the relationship between the distance in meters from a property to a train station. There is a strong positive relationship between the distance of a house and the nearest train station. For apartments, the relationship varies depending on how far away the train station is. The plot shows that there is a slight positive relationship from around 0-800 meters with price, and then a slight negative relationship from 800 meters to 2000 meters. This suggests that apartments right next to a sky train station are valued less. On the other hand, apartments increase in value until around 800 meters, then the price decreases from 800 to 2000 meters. 
+
+```{r fig.cap="Scattreplot of Price and Distance to the Nearest Sky Train Station By Property Type", fig.height=4, fig.width=7}
+df %>%
+  ggplot(aes(x = sky_train, y = price)) +
+  geom_point() +
+  geom_smooth() +
+  scale_y_log10(label = scales::dollar_format()) +
+  facet_wrap(~type) +
+  theme_minimal() +
+  ylab("Price") +
+  xlab("Sky Train Distance in Meters")
+```
+
+Figure 8 shows the strongest correlation between the response variable price and the predictor square feet. The higher the number of square feet, the higher valued a property is. 
+
+```{r fig.cap="Scattreplot of Price and Square Feet", fig.height=4, fig.width=7}
+df %>%
+  dplyr::arrange(price) %>%
+  ggplot(aes(x = square_feet, y = price)) +
+  geom_point(alpha = 0.5) +
+  theme_minimal() +
+  scale_y_continuous(label = scales::dollar_format()) +
+  scale_x_continuous(label = scales::number_format()) +
+  geom_smooth(se = F) +
+  ggtitle("") +
+  xlab("Square Feet") +
+  ylab("Price") +
+  theme(legend.position = "bottom")
+```
+
+\newpage
+
+## Data Biases From Scraped Websites
+
+Figure 9 shows a box plot of the price of a property by website and property type. It is interesting to see that duplexes are more expensive on Remax compared to Zolo and Rew. Also, home prices on Point 2 Home are less expensive compared to Zolo and Rew. This could lead to some biases in the final model and also suggests that it is important to include the website as a categorical predictor to mitigate this bias. To reduce this bias, we should include the website as a categorical predictor in the model.   
+
+```{r fig.cap="Boxplot of Prices by Homes and Websites", fig.height=4, fig.width=7}
+df %>%
+  dplyr::filter(type %in% c("Townhouse", "Apartment", "Duplex", "House")) %>%
+  ggplot(aes(x = type, y = price, fill = website)) +
+  geom_boxplot(alpha = 0.4) +
+  scale_y_log10(label = scales::dollar_format()) +
+  theme_minimal() +
+  theme(legend.position = "bottom") +
+  labs(
+    title = "Price by Home Type and Website",
+    subtitle = "Is there any bias in home prices on different websites?",
+    fill = "Websites"
+  ) +
+  ylab("") +
+  xlab("")
+```
+
+## Interaction Effects
+
+When looking at interactions, I decided to run a MARS model with the `earth` package for all numerical variables in the data set. For this, I set up a grid with two hyperparameters. One for the number of interactions that the model should consider and the second one for how many predictor variables there should be in the model. For this, I used the caret package and 10-fold cross-validation to choose the best hyperparameters. Figure 10 and Table 4 show the results of the cross-validation process. Table 5 shows the most important interaction effects according to the MARS model.
+
+```{r fig.cap="Cross-Validation Results for MARS Model", fig.height=4, fig.width=7}
+preds <- df %>%
+  dplyr::select_if(is.numeric) %>%
+  dplyr::select(-price) %>%
+  colnames()
+mars_model_formula <- paste0(preds, collapse = " + ") %>%
+  paste0("price ~ ", .) %>%
+  as.formula()
+
+# create a tuning grid
+hyper_grid <- expand.grid(
+  degree = 1:3,
+  nprune = seq(2, 35, length.out = 20) %>% floor()
+)
+
+tuned_mars <- train(
+  x = df %>% dplyr::select(-c(price, type, neighborhood, website)),
+  y = df$price,
+  method = "earth",
+  metric = "RMSE",
+  trControl = trainControl(method = "cv", number = 10),
+  tuneGrid = hyper_grid
+)
+
+ggplot(tuned_mars) +
+  theme_minimal() +
+  theme(legend.position = "bottom") +
+  xlim(1, 35) +
+  scale_y_continuous(breaks = seq(0, 35, by = 5))
+```
+
+Because I would like to see if there are any interaction effects in the data, I decided to choose the model with degree three and 31 parameters in the model. 
+
+```{r}
+tuned_mars$results %>%
+  dplyr::arrange(MAE) %>%
+  dplyr::group_by(degree) %>%
+  dplyr::slice(1:2) %>%
+  dplyr::ungroup() %>%
+  dplyr::select(degree, nprune, MAE, RMSE) %>%
+  dplyr::mutate(dplyr::across(.cols = c(MAE, RMSE), ~ scales::dollar(round(.)))) %>%
+  knitr::kable(caption = "MARS Cross-Validation Results")
+```
+
+```{r}
+earth_model <- earth::earth(
+  mars_model_formula,
+  data = df,
+  pmethod = "cv",
+  nfold = 10,
+  degree = 3,
+  nprune = 31
+)
+
+vars_selected <- earth_model$coefficients %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column(var = "preds") %>%
+  filter(stringr::str_detect(preds, "\\*"))
+
+vars_selected %>%
+  knitr::kable(caption = "Interaction Effects Chosen by the MARS Algorithm")
+```
+
+In Figure 11, the most interesting interactions are displayed. The interactions are modeled with a GAM model and the tensor product between the two predictors, displayed in each plot, was used. 
+
+In the upper left plot, square feet are displayed on the x-axis and longitude on the y-axis. It is interesting to see that for high and low longitude values and high square feet, properties are the most expensive. However, for longitude values in the middle range, properties are not as expensive as for extreme values for longitude. This might be because of a bad neighborhood for these longitude values.
+
+The upper right plot shows lot size on the y-axis and how far the nearest sky train station is away from a property on the x-axis. It is noticeable that prices are highest for large lots that are far away from sky train stations. Properties that are very close to sky train stations and have large lots are not valued as much. It is interesting to see a bump in the plot for lot sizes in the middle ranges and properties that are near a sky train station but not right next to one. Probably of the noise, people do not value living next to a sky train station but there seems to be a sweet spot where people value a close distance to a nearby sky train station. 
+
+The middle left corner shows latitude on the x-axis and lot size on the y-axis. The plot looks similar to the square feet and longitude plot. For extreme values of latitude and a large lot size, properties are expensive. For the middle range of values for latitude, lot size does not matter as much. 
+
+The middle right plot shows the number of commercial services near a property on the y-axis and the sky train distance on the x-axis. Property prices do not vary much for properties very close to a sky train station for any number of commercial services and are valued highly when being far away from a sky train station and having no commercial services around. These properties are most likely very expensive single-family homes in rural areas. 
+
+The lower left plot shows the interaction between square feet and longitude, accounting for all predictor variables in the model. Adjusting for these variables, the interaction effect looks very different. I believe, that the main reason for this behavior is that lot size, square feet, and neighborhood explain a lot of the variation in housing prices and therefore, the type of a home effect is less strong.
+
+Similarly for lot size and the nearest sky train station. There is generally a trend where the farther away the sky train station is, the more expensive a home and also the greater the lot size the more expensive a property is. 
+
+
+```{r fig.cap="Interaction Effects In Hosuing Data"}
+preds <- df %>%
+  dplyr::select_if(is.numeric) %>%
+  dplyr::select(-price) %>%
+  colnames()
+gam_model_formula <- paste0("s(", preds, ")", collapse = " + ") %>%
+  paste0("price ~ neighborhood + type +", .) %>%
+  as.formula()
+
+par(
+  mfrow = c(3, 2), # 2x2 layout
+  oma = c(2, 2, 0, 0), # two rows of text at the outer left and bottom margin
+  mar = c(1, 1, 0, 0), # space for one row of text at ticks and to separate plots
+  mgp = c(2, 1, 0), # axis label at 2 rows distance, tick labels at 1 row
+  xpd = NA
+)
+vis.gam(gam(data = df, price ~ te(square_feet, lng)), theta = -50, phi = 20)
+vis.gam(gam(data = df, price ~ te(sky_train, lot_size)), theta = 20, phi = 20)
+vis.gam(gam(data = df, price ~ te(lat, lot_size)), theta = 60, phi = 20)
+vis.gam(gam(data = df, price ~ te(sky_train, commercial_services)),  theta = -75, phi = 20)
+vis.gam(
+  gam(data = df, gam_model_formula), 
+  type = "response",
+  view = c("square_feet", "lng"),
+  theta = -60, phi = 20
+)
+vis.gam(
+  gam(data = df, gam_model_formula), 
+  type = "response",
+  view = c("sky_train", "lot_size"),
+  theta = -60, phi = 20
+)
+```
+
+
+## Partial Effects of GAM Model
+
+```{r fig.height=9, fig.width=7, fig.cap="Partial Effects From GAM Model Where Smoothed Out Predictors Were Omitted"}
+preds <- df %>%
+  dplyr::select_if(is.numeric) %>%
+  dplyr::select(-price) %>%
+  colnames()
+gam_model_formula <- paste0("s(", preds, ")", collapse = " + ") %>%
+  paste0("price ~ neighborhood + type +", .) %>%
+  as.formula()
+
+gam_model <- mgcv::gam(
+  gam_model_formula,
+  data = df,
+  method = "GCV.Cp",
+  select = TRUE,
+  gamma = 1
+)
+
+par(mfrow = c(4, 3))
+for (i in 1:12) {
+  plot(gam_model, select = i)
+}
+```
+
+Figure 12 shows the most interesting partial effects where all predictors that were smoothed out by the penalty term were omitted. The fitted GAM model used all predictors shown in Table 3.
+
+We can see that for square feet, the partial effects correspond to Figure 8 where with increasing square feet, the price of a property increases.
+
+For the sky train stations, there is a slight decrease in the value of a property the greater the distance between a property and the nearest sky train station. The price increases when a sky train station is more than 3000 meters away from a property. When someone is familiar with Vancouver and the train stations, then one knows that sky train stations are far away from West Vancouver where the most expensive properties are located according to Figure 4. So seeing the value of a home increase after 3000 meters is expected. Interestingly, the value of properties decreases dramatically when a property is farther away than 600 meters from the nearest bus stop.
+
+It is also interesting to see that the higher the longitude value, the higher the price of a home. This is contrary to the correlation plot, Figure 4, and the density map, Figure 5, where we see that expensive homes are located in the west of Vancouver. Figure 13 shows a GAM model on the left-hand side with only longitude as predictor and on the right hand-side, neighborhood, the type of the property, square feet, and lot size were added as predictor variables. Adjusting for these variables, the longitude effect is not as high anymore. This explains the longitude graph in Figure 12 where all predictors were included in the GAM model.
+
+```{r fig.cap="The left-hand side plot displays a GAM model with price as the response variable and longitude as the only predictor variable. As seen in Figure 4 and Figure 5, the lower the longitude, the higher the price. The right-hand side plot adjusts for the property type, neeighborhood, square feet, and lot size. We can see that adjusting for these variables, the effect of longitude flattens out."}
+gam_model_formula <- paste0("s(", "lng", ")") %>% 
+  paste0("price ~ ", .) %>%
+  as.formula()
+
+gam_model1 <- mgcv::gam(
+  gam_model_formula,
+  data = df,
+  method = "GCV.Cp",
+  select = TRUE,
+  gamma = 1
+)
+
+v <- c("lng", "square_feet", "lot_size")
+gam_model_formula <- paste0("s(", v, ")", collapse = " + ") %>% 
+  paste0("price ~ neighborhood + type +", .) %>%
+  as.formula()
+
+gam_model2 <- mgcv::gam(
+  gam_model_formula,
+  data = df,
+  method = "GCV.Cp",
+  select = TRUE,
+  gamma = 1
+)
+
+par(mfrow = c(1, 2))
+plot(gam_model1, select = 1)
+plot(gam_model2, select = 1)
+```
+
+
+```{r}
+# set.seed(123)
+# earth_model <- earth::earth(
+#   mars_model_formula,
+#   data = df,
+#   pmethod = "cv",
+#   nfold = 10,
+#   degree = 2
+# )
+#
+# vars_selected <- earth_model$coefficients %>%
+#   as.data.frame() %>%
+#   tibble::rownames_to_column(var = "preds") %>%
+#   dplyr::pull(preds) %>%
+#   stringr::str_remove_all("([0-9]+|^h|\\(|\\)|\\-|\\.)") %>%
+#   unique() %>%
+#   .[stringr::str_detect(., "Intercept", negate = TRUE)]
+#
+# lm_formula <- vars_selected %>%
+#   paste0(collapse = " + ") %>%
+#   paste0("(", ., ")^2") %>%
+#   paste0("price ~ ", .)
+#
+# lm(lm_formula, data = df) %>%
+#   stats::step()
+#
+# lm(formula = price ~ square_feet + lng + beds + sky_train + baths +
+#     lot_size + commercial_services + bus_stop + lat + food_beverages +
+#     square_feet:lng + square_feet:beds + square_feet:sky_train +
+#     square_feet:baths + square_feet:lot_size + square_feet:commercial_services +
+#     square_feet:bus_stop + square_feet:lat + square_feet:food_beverages +
+#     lng:sky_train + lng:baths + lng:commercial_services + lng:bus_stop +
+#     lng:lat + beds:sky_train + beds:baths + beds:lot_size + beds:bus_stop +
+#     beds:lat + beds:food_beverages + sky_train:baths + sky_train:lot_size +
+#     sky_train:commercial_services + sky_train:bus_stop + baths:lot_size +
+#     baths:commercial_services + baths:bus_stop + lot_size:bus_stop +
+#     lot_size:lat + lot_size:food_beverages + commercial_services:bus_stop +
+#     bus_stop:lat + lat:food_beverages, data = df) %>%
+#   summary() %>%
+#   broom::tidy() %>%
+#   dplyr::arrange(p.value) %>%
+#   dplyr::filter(stringr::str_detect(term, "\\:"), p.value <= 0.001)
+#
+# library(mgcv)
+# vis.gam(gam(data = df, price ~ te(square_feet, lot_size)))
+# vis.gam(gam(data = df, price ~ te(square_feet, commercial_services)))
+# vis.gam(gam(data = df, price ~ te(sky_train, bus_stop)))
+# vis.gam(gam(data = df, price ~ te(sky_train, lot_size)))
+```
+
+\newpage
+
+# Statistical Analysis 
+
+## Data Preprocessing 
+
+I divided the data into a training and a testing data set. 80% of the data is for training and 20% is for testing. In addition to that, 80% of the training data was split into 10 equal data sets to perform 10-fold cross-validation to tune the hyperparameters. All data pre-processing steps are done separately for folds and testing data to avoid data leakage. The pre-processing steps involved one hot encoding for dummy variables and then normalizing all predictor variables. 
+
+```{r}
+set.seed(123)
+splits <- rsample::initial_split(df, 0.8)
+training <- rsample::training(splits)
+testing <- rsample::testing(splits)
+cv_splits <- rsample::vfold_cv(training, cv = 10)
+```
+
+## Random Forest
+
+The first model that I built is a random forest model where I tuned three hyperparameters. The libraries I used were `tidymodels` and `ranger`. 
+I used Latin Hypercube samples and a grid of 30 observations for the three tuning parameters. The results of the hypereparameter tuning are shown in Figure 14.
+
+```{r eval=FALSE}
+registerDoFuture()
+n_cores <- parallel::detectCores()
+
+plan(
+  strategy = cluster,
+  workers = parallel::makeCluster(n_cores)
+)
+
+# random forest model specification
+rf_spec <- parsnip::rand_forest(
+  mtry = tune::tune(),
+  trees = tune::tune(),
+  min_n = tune::tune()
+) %>%
+  parsnip::set_engine(
+    "ranger",
+    num.threads = 7, importance = "impurity"
+  ) %>%
+  parsnip::set_mode("regression")
+
+van_rec_rf <- recipes::recipe(
+  price ~ .,
+  data = training 
+) %>%
+  recipes::step_dummy(all_nominal_predictors()) %>%
+  recipes::step_normalize(-all_outcomes())
+van_rec_rf %>%
+  prep() %>%
+  juice()
+
+# random forest workflow
+rf_wf <- workflows::workflow() %>%
+  workflows::add_recipe(van_rec_rf) %>%
+  workflows::add_model(rf_spec)
+
+rf_grid <-
+  dials::grid_latin_hypercube(
+    dials::min_n(),
+    dials::mtry(range = c(6, length(training) - 1)),
+    dials::trees(),
+    size = 30
+  )
+
+tune_res <- rf_wf %>%
+  tune::tune_grid(
+    resamples = cv_splits,
+    grid = rf_grid,
+    metrics = yardstick::metric_set(rmse, mae, rsq, mape)
+  )
+
+readr::write_rds(tune_res, here::here("data/models/tune_rf1.rds"))
+```
+
+There are no improvements in the number of trees or randomly selected predictors. However, the smaller the node size, the lower the mean absolute error and the higher the r-squared value. Therefore I set the range for the minimal node size between one and eight and used a Latin Hypercube grid to tune the hyperparameters for a second time. The results of the hyperparameter tuning for the second run are shown in Figure 15.
+
+```{r fig.cap="Tuning Parametrs Random Forest After Initial Grid", fig.height=4, fig.width=7}
+tune_rf1 <- readr::read_rds(here::here("data/models/tune_rf1.rds"))
+autoplot(tune_rf1) +
+  geom_smooth() +
+  theme_minimal()
+```
+
+```{r eval=FALSE}
+rf_grid <-
+  dials::grid_latin_hypercube(
+    dials::min_n(range = c(1, 8)),
+    dials::mtry(range = c(6, length(training) - 1)),
+    dials::trees(),
+    size = 30
+  )
+
+tune_res <- rf_wf %>%
+  tune::tune_grid(
+    resamples = cv_splits,
+    grid = rf_grid,
+    metrics = yardstick::metric_set(rmse, mae, rsq, mape)
+  )
+
+readr::write_rds(tune_res, here::here("data/models/tune_rf2.rds"))
+```
+
+Based on the plot, the lowest mean absolute error occurs when there are between 20 and 25 predictors selected and the minimal node size is between one and three. 
+
+```{r fig.cap="Tuning Paramatres Random Forest Scond Run After Grid Optimization", fig.height=4, fig.width=7}
+tune_rf2 <- readr::read_rds(here::here("data/models/tune_rf2.rds"))
+autoplot(tune_rf2) +
+  geom_smooth() +
+  theme_minimal()
+```
+
+```{r eval=FALSE}
+final_rf <- rf_wf %>%
+  tune::finalize_workflow(
+    tune::show_best(x = tune_res, metric = "mae", n = 1)
+  )
+
+model_id <- tune::collect_metrics(tune_res) %>%
+  dplyr::filter(.metric == "mae") %>%
+  dplyr::arrange(mean) %>%
+  dplyr::pull(.config) %>%
+  .[1]
+
+cv_metrics_rf <- tune::collect_metrics(tune_res) %>%
+  dplyr::filter(.config == model_id)
+readr::write_rds(cv_metrics_rf, here::here("data/models/cv_metrics_rf.rds"))
+cv_metrics_rf <- readr::read_rds(here::here("data/models/cv_metrics_rf.rds"))
+
+final_rf <- final_rf %>%
+  tune::last_fit(
+    splits,
+    metrics = metric_set(rmse, mae, rsq, mape)
+  )
+
+readr::write_rds(final_rf, here::here("data/models/final_rf.rds"))
+final_rf <- readr::read_rds(here::here("data/models/final_rf.rds"))
+
+testing_metrics_rf <- final_rf$.metrics
+```
+
+Table 6 shows the results of the best model. The best model has 21 predictors, 1031 trees, and a node size of two. After determining the best hyperparameters through 10-fold cross-validation by choosing the model with the lowest mean absolute error, the final model is trained on the full 80% of training data and evaluated on the 20% of testing data. 
+
+```{r}
+# random forest
+cv_metrics_rf <- readr::read_rds(here::here("data/models/cv_metrics_rf.rds"))
+final_rf <- readr::read_rds(here::here("data/models/final_rf.rds"))
+testing_metrics_rf <- final_rf$.metrics
+```
+
+```{r}
+cv_metrics_rf %>%
+  .[, 1:6] %>%
+  format_table_numbers(column_name = ".metric", column_value = "mean") %>%
+  tidyr::pivot_wider(names_from = .metric, values_from = mean) %>%
+  dplyr::select(-.estimator) %>%
+  purrr::set_names(
+    c(
+      "Predictors Selected", "Trees", "Minimum Node Size", "MAE", "MAPE", "RMSE", "R-SQUARED"
+    )
+  ) %>%
+  knitr::kable(caption = "Coss-Validation Results for Random Forest")
+```
+
+Table 7 shows the results of the testing data. The mean absolute error is \$221,627 dollars, the mean absolute percentage error is 11.83%, and the r-squared value is 91.27%. This means that all the predictors explain around 91% of the variation in prices in the test set. 
+
+```{r}
+testing_metrics_rf[[1]] %>%
+  dplyr::mutate(Model = "Random Forest") %>%
+  format_table_numbers(column_name = ".metric", column_value = ".estimate") %>%
+  tidyr::pivot_wider(names_from = .metric, values_from = .estimate) %>%
+  dplyr::select(Model:mape) %>%
+  dplyr::select(Model, mae, mape, rmse, rsq) %>%
+  purrr::set_names(
+    c(
+      "Model", "MAE", "MAPE", "RMSE", "R-SQUARED"
+    )
+  ) %>%
+  knitr::kable(
+    caption = "Random Forest Results For Testing data"
+  )
+```
+
+\newpage
+
+### Variable Importance Random Forest
+
+```{r eval=FALSE}
+final_rf <- rf_wf %>%
+  tune::finalize_workflow(
+    tune::show_best(x = tune_res, metric = "mae", n = 1)
+  )
+readr::write_rds(final_rf, here::here("data/models/final_rf_vip.rds"))
+```
+
+Figure 16 shows the 15 most important variables determined by the random forest model. Square feet is the most important predictor when determining the price of a property followed by lot size, baths, beds, longitude, the distance to the nearest sky train station, the distance to the nearest park, latitude, and if a website came from a Zolo listing or not. It is interesting that the type of a home is not very important relative to other predictors. The lot size is probably explaining the variation in price better than the property type.
+
+```{r fig.cap="Variable Importance Random Forest", fig.height=4, fig.width=7}
+final_rf_vip <- readr::read_rds(here::here("data/models/final_rf_vip.rds"))
+
+final_rf_vip %>%
+  fit(data = training) %>%
+  pull_workflow_fit() %>%
+  vip::vip(geom = "point", num_features = 15) +
+  theme_minimal() +
+  ggtitle("Variable Random Forest")
+ggsave("VI_RF.png", width = 8, height = 8)
+```
+
+## Gradient Boosted Decision Tree
+
+The second model that I evaluated was a gradient-boosted decision tree. The hyperparameters I tuned for this model were the tree depth, the minimum node size, loss reduction, learning rate, sample size, and the number of predictors chosen. I again used a Latin Hypercube to sample 20 observations. I set the range of the number of predictors chosen from six to the number of predictors in the data set and the learning rate from 0.003 to 0.27. 
+
+```{r eval=FALSE}
+xgb_spec <- parsnip::boost_tree(
+  trees = 1000,
+  tree_depth = tune::tune(),
+  min_n = tune::tune(),
+  loss_reduction = tune::tune(),
+  sample_size = tune::tune(),
+  mtry = tune::tune(),
+  learn_rate = tune::tune()
+) %>%
+  set_engine("xgboost") %>%
+  set_mode("regression")
+
+grid_spec_xgb <- dials::grid_latin_hypercube(
+  dials::mtry(range = c(6, length(training) - 1)),
+  dials::min_n(),
+  dials::tree_depth(),
+  sample_size = dials::sample_prop(),
+  dials::learn_rate(range = c(-2.5, -0.5)),
+  dials::loss_reduction(),
+  size = 20
+)
+
+# xgb workflow
+xgb_wf <- workflows::workflow() %>%
+  workflows::add_recipe(van_rec_rf) %>%
+  workflows::add_model(xgb_spec)
+
+tune_res_xgb <- xgb_wf %>%
+  tune::tune_grid(
+    resamples = cv_splits,
+    grid = grid_spec_xgb,
+    metrics = yardstick::metric_set(rmse, mae, rsq, mape)
+  )
+
+readr::write_rds(tune_res_xgb, here::here("data/models/tune_xgb1.rds"))
+```
+
+In Figure 17 we see the values of the hyperparameters associated with the different metrics. From the plot, I concluded that 1-15 predictors give the best mean absolute error combined when 60% to 90% of the samples are selected. Moreover, a node size between 1 and 10 gives the lowest mean absolute error.
+
+In the next round of tuning, I added these changes and sampled 20 observations from a Grid Latin Hypercube, and started the 10-fold cross-validation again to determine the best hyperparameters. The results are shown in Figure 18.
+
+```{r fig.cap="XG Boost Hyperparamters After First Run", fig.width=12, fig.height=7}
+tune_xgb1 <- readr::read_rds(here::here("data/models/tune_xgb1.rds"))
+
+autoplot(tune_xgb1) +
+  geom_smooth() +
+  theme_minimal() +
+  theme(strip.text.x = element_text(size = 7)) +
+  scale_x_continuous(guide = guide_axis(angle = -45))
+```
+
+```{r eval=FALSE}
+grid_spec_xgb <- dials::grid_latin_hypercube(
+  dials::mtry(range = c(1, 15)),
+  dials::min_n(range = c(1, 10)),
+  dials::tree_depth(range = c(5, 15)),
+  sample_size = dials::sample_prop(range = c(0.6, 0.9)),
+  dials::learn_rate(range = c(-2.0, -1.5)),
+  dials::loss_reduction(),
+  size = 20
+)
+
+registerDoFuture()
+n_cores <- parallel::detectCores()
+
+plan(
+  strategy = cluster,
+  workers = parallel::makeCluster(n_cores)
+)
+
+tune_res_xgb <- xgb_wf %>%
+  tune::tune_grid(
+    resamples = cv_splits,
+    grid = grid_spec_xgb,
+    metrics = yardstick::metric_set(rmse, mae, rsq, mape)
+  )
+readr::write_rds(tune_res_xgb, here::here("data/models/tune_xgb2.rds"))
+
+final_xgb <- xgb_wf %>%
+  tune::finalize_workflow(
+    tune::show_best(x = tune_res_xgb, metric = "mae", n = 1)
+  )
+readr::write_rds(final_xgb, here::here("data/models/final_xgb_vip.rds"))
+
+model_id <- tune::collect_metrics(tune_res_xgb) %>%
+  dplyr::filter(.metric == "mae") %>%
+  dplyr::arrange(mean) %>%
+  dplyr::pull(.config) %>%
+  .[1]
+
+cv_metrics_xgb <- tune::collect_metrics(tune_res_xgb) %>%
+  dplyr::filter(.config == model_id)
+readr::write_rds(cv_metrics_xgb, here::here("data/models/cv_metrics_xgb.rds"))
+
+final_xgb <- final_xgb %>%
+  tune::last_fit(
+    splits,
+    metrics = metric_set(rmse, mae, rsq, mape)
+  )
+
+readr::write_rds(final_xgb, here::here("data/models/final_xgb.rds"))
+```
+
+```{r fig.cap="XG Boost Hyperparamters After Seccond Run", fig.width=12, fig.height=7}
+tune_xgb2 <- readr::read_rds(here::here("data/models/tune_xgb2.rds"))
+
+autoplot(tune_xgb2) +
+  geom_smooth() +
+  theme_minimal() +
+  theme(strip.text.x = element_text(size = 7)) +
+  scale_x_continuous(guide = guide_axis(angle = -45))
+```
+
+```{r}
+cv_metrics_xgb <- readr::read_rds(here::here("data/models/cv_metrics_xgb.rds"))
+```
+
+Table 8 shows the results of the best model from cross-validation. The final model is trained on the full 80% of training data and evaluated on the 20% of testing data. 
+
+```{r}
+cv_metrics_xgb %>%
+  .[, 1:9] %>%
+  format_table_numbers(column_name = ".metric", column_value = "mean") %>%
+  tidyr::pivot_wider(names_from = .metric, values_from = mean) %>%
+  dplyr::select(-.estimator) %>%
+  purrr::set_names(
+    c(
+      "# of Predictors", "Min Node Size", "Tree Depth", "Learning Rate", "Loss Reduction",
+      "Sample Size", "MAE", "MAPE", "RMSE", "R-SQUARED"
+    )
+  ) %>%
+  dplyr::mutate(
+    dplyr::across(
+      c("Learning Rate", "Loss Reduction", "Sample Size"),
+      ~ round(., 4)
+    )
+  ) %>% 
+  knitr::kable(
+    caption = "XG Boost Results For Cross Validation Data"
+  )
+```
+
+Table 9 shows the results of the testing data. The mean absolute error is \$202,887 dollars, the mean absolute percentage error is 10.32%, and the r-squared value is 91.69%. This means that all the predictors explain around 92% of the variation in prices in the test set. 
+
+```{r}
+# XG Boost
+cv_metrics_xgb <- readr::read_rds(here::here("data/models/cv_metrics_xgb.rds"))
+final_xgb <- readr::read_rds(here::here("data/models/final_xgb.rds"))
+testing_metrics_xgb <- final_xgb$.metrics
+
+testing_metrics_xgb[[1]] %>%
+  dplyr::mutate(Model = "XG Boost") %>%
+  format_table_numbers(column_name = ".metric", column_value = ".estimate") %>%
+  tidyr::pivot_wider(names_from = .metric, values_from = .estimate) %>%
+  dplyr::select(Model:mape) %>%
+  dplyr::select(Model, mae, mape, rmse, rsq) %>%
+  purrr::set_names(
+    c(
+      "Model", "MAE", "MAPE", "RMSE", "R-SQUARED"
+    )
+  ) %>%
+  knitr::kable(
+    caption = "XG Boost Results For Testing Data"
+  )
+```
+
+### Variable Importance XG Boost
+
+```{r fig.cap="Variable Importance of Gradient Boosted Decision Tree", fig.height=4, fig.width=7}
+final_xgb <- readr::read_rds(here::here("data/models/final_xgb_vip.rds"))
+final_xgb %>%
+  fit(data = training) %>%
+  pull_workflow_fit() %>%
+  vip::vip(geom = "point", num_features = 15) +
+  theme_minimal() +
+  ggtitle("Variable Importance XGB")
+ggsave("VI_XGB.png", width = 8, height = 8)
+```
+
+Variable importance between the random forest and the XG boost model look very similar. However, it is interesting to note that some crime variables are higher ranked for the XG boost model compared to the random forest. 
+
+Both models agree on the the ranks one to five. The random forest goes with the sky train variable for rank six and parks for rank seven followed by latitude for rank eight. The XG boost model ranks theft from vehicle and theft of vehicle as number six and seven respectively followed by if a website is listed on Zolo or not. The predictors latitude, sky train, and parks are ranked nine, ten, and eleven respectively. 
+
+# Model Comparison 
+
+From Figure 20 we can conclude that both models did well when predicting price. The correlation between the actual price and the predictions is around 96% for both models. The gradient-boosted decision tree does slightly better than the random forest model.
+
+```{r fig.cap="Actual Property Prices Versus Predictions", fig.width=10, fig.height=6}
+# random forest
+cv_metrics_rf <- readr::read_rds(here::here("data/models/cv_metrics_rf.rds"))
+final_rf <- readr::read_rds(here::here("data/models/final_rf.rds"))
+testing_metrics_rf <- final_rf$.metrics
+
+# xgb
+cv_metrics_xgb <- readr::read_rds(here::here("data/models/cv_metrics_xgb.rds"))
+final_xgb <- readr::read_rds(here::here("data/models/final_xgb.rds"))
+testing_metrics_xgb <- final_xgb$.metrics
+
+rf <- cor(final_rf$.predictions[[1]]$price, final_rf$.predictions[[1]]$.pred) %>% round(3)
+xgb <- cor(final_xgb$.predictions[[1]]$price, final_xgb$.predictions[[1]]$.pred) %>% round(3)
+label_plot <- dplyr::tibble(
+  Model = c("Random Forest", "XG Boost"),
+  Correlation = c(rf, xgb) %>% paste("r = ", .)
+)
+
+final_rf$.predictions[[1]] %>%
+  dplyr::mutate(Model = "Random Forest") %>%
+  dplyr::bind_rows(
+    final_xgb$.predictions[[1]] %>%
+      dplyr::mutate(Model = "XG Boost")
+  ) %>%
+  ggplot(aes(x = .pred, y = price)) +
+  geom_point(alpha = 0.6) +
+  geom_abline(slope = 1, color = "steelblue") +
+  facet_wrap(~Model) +
+  theme_minimal() +
+  ylab("Actual Price") +
+  xlab("Prediction") +
+  geom_text(
+    data = label_plot,
+    aes(
+      x = 2000000, y = 7000000,
+      label = Correlation
+    ), size = 4
+  ) +
+  scale_y_continuous(
+    label = scales::dollar_format()
+  ) +
+  scale_x_continuous(
+    label = scales::dollar_format(),
+    guide = guide_axis(angle = -45)
+  )
+```
+
+Table 10 summarizes the results for the cross-validation score and also the score for predicting the test set. 
+
+Both models predicted listing prices very well. Especially for property listing prices below \$2,500,000 dollars, the correlation between predicted and actual listing prices is very high. For listing prices higher than \$5,000,000 dollars, the random forest model underestimated most of the listing prices. This is because most of the dots are above the blue line for the random forest model.
+
+We see a similar behavior for the boosted tree model. For listing prices higher than \$5,000,000 dollars, the boosted tree model also underestimated most of the listing prices. However, it appears that is does not underestimated the prices as much as the random forest model. This is because visually it seems that more of the dots are below the blue line for a price point greater than \$5,000,000 dollars when comparing it to the random forest graph. Also, for the gradient-boosted tree model, it looks like the correlation between predicted and actual listing prices is higher for properties below \$2,500,000 dollars. The dots seem to be closer to the blue line without as much variation as in the random forest plot.
+
+Overall, both models are very similar and the gradient-boosted decision tree does slightly better than the random forest. Also, both models roughly rank the predictors in similar order. Based on the mean absolute error for the cross-validation data and test set data, I would choose the gradient boosted decision tree over the random forest. The only disadvantage is additional compute time due to more hyperparameters.  
+
+```{r}
+cv_metrics_rf %>%
+  dplyr::select(.metric, mean) %>%
+  dplyr::mutate(Model = "Random Forest") %>%
+  dplyr::bind_rows(
+    cv_metrics_xgb %>%
+      dplyr::select(.metric, mean) %>%
+      dplyr::mutate(Model = "XG Boost")
+  ) %>%
+  format_table_numbers(column_name = ".metric", column_value = "mean") %>%
+  tidyr::pivot_wider(
+    names_from = .metric,
+    values_from = mean
+  ) %>%
+  purrr::set_names(c("Model", "MAE", "MAPE", "RMSE", "R-SQUARED")) %>%
+  dplyr::mutate_if(is.numeric, ~ round(., 3)) %>%
+  dplyr::mutate(
+    Results = "Cross-Validation"
+  ) -> cv_table
+```
+
+```{r}
+testing_metrics_rf[[1]] %>%
+  dplyr::mutate(Model = "Random Forest") %>%
+  dplyr::bind_rows(
+    testing_metrics_xgb[[1]] %>%
+      dplyr::mutate(Model = "XG Boost")
+  ) %>%
+  format_table_numbers(column_name = ".metric", column_value = ".estimate") %>%
+  tidyr::pivot_wider(names_from = .metric, values_from = .estimate) %>%
+  dplyr::select(Model:mape) %>%
+  dplyr::select(Model, mae, mape, rmse, rsq) %>%
+  purrr::set_names(
+    c(
+      "Model", "MAE", "MAPE", "RMSE", "R-SQUARED"
+    )
+  ) %>%
+  dplyr::mutate(
+    Results = "Testing Data"
+  ) %>%
+  dplyr::bind_rows(
+    ., cv_table
+  ) %>%
+  knitr::kable(
+    caption = "Model Results Of Cross-Validation and Testing Data Sets"
+  )
+```
+
+
+# Future Work
+
+The data set can be expanded to include other municipalities around Vancouver such as Burnaby, Surrey, Richmond, and North Vancouver. In addition to expanding the area, more detailed predictors could potentially be collected. Examples of such predictors would be what floor an apartment is on and what amenities a property has. Other variables of interest would be strata fees for apartments and property taxes for houses. Moreover, it would be interesting to extract words from the description and build a model from them.
+
+In addition to improving the model with more variables, I also collected rent prices from Craigslist. The analysis in this report can be expanded to building a model that predicts rental prices. With this model, price-to-rent ratios for various houses can be estimated.
+
+As more and more observations are being collected over several months, it would be interesting to build a time series model to predict where the overall real estate market is heading. To do that, additional variables could be collected about unemployment rates or interest rates.
+
+Another possible idea would be to build a recommendation algorithm and cluster properties that are very similar to each other.  
+
+\newpage
+
+# Appendix
+
+```{r fig.cap="Choropleth Map for the Number of Properties in Each Neighbourhood"}
+df_augmented <- readr::read_csv(here::here("data/report_data/df1.rds"))
+df <- readr::read_csv(
+  here::here(
+    "data/analysis/df.csv"
+  )
+)
+
+df <- df %>%
+  dplyr::filter(
+    rent_buy == "buy", !is.na(type), type != "2 BedsBds",
+    type != "Triplex" & type != "Other",
+    square_feet >= 300, price <= 10000000
+  ) %>%
+  dplyr::mutate(
+    type = ifelse(type == "House with Acreage", "House", type)
+  ) %>%
+  dplyr::select(
+    square_feet, price, beds, baths, type, lot_size, neighborhood,
+    lng, lat, sky_train, bus_stop, parks, schools, commercial_services,
+    food_beverages, food_beverages, website,
+    break_and_enter_commercial:vehicle_collision_or_pedestrian_struck_with_injury
+  )
+
+homes_df_summarized <- df %>%
+  dplyr::group_by(neighborhood) %>%
+  dplyr::summarise(
+    n = dplyr::n()
+  ) %>%
+  dplyr::ungroup()
+
+# vancouver map boundaries, shape file
+boundaries <- read_sf("data/augmentation_data/local-area-boundary.shp")
+homes_df <- homes_df_summarized %>%
+  dplyr::inner_join(
+    boundaries,
+    by = c("neighborhood" = "name")
+  ) %>%
+  sf::st_as_sf()
+
+ggplot(data = homes_df) +
+  geom_sf() +
+  geom_sf(aes(fill = n)) +
+  scale_fill_viridis_c(trans = "sqrt", alpha = .4) +
+  coord_sf(xlim = c(-123, -123.25), ylim = c(49.18, 49.3)) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    legend.key.width = unit(3, "cm")
+  ) +
+  labs(fill = "# of Properties")
+```
+
+```{r}
+homes_df %>%
+  dplyr::arrange(desc(n)) %>%
+  dplyr::as_tibble() %>%
+  dplyr::select(Neighborhood = neighborhood, `Number of Propereties` = n) %>%
+  knitr::kable(caption = "Number of Properties in Each Vancouver Neighborhood")
+```
+
+```{r results="asis"}
+library(arsenal)
+
+mycontrols <- tableby.control(
+  test = FALSE,
+  numeric.stats = c("meanse", "median", "q1q3", "range"),
+  cat.stats = c("countpct"),
+  stats.labels = list(median = "Median", q1q3 = "Q1,Q3")
+)
+
+tab1 <- tableby(
+  type ~ .,
+  data = df, digits = 2, test = FALSE,
+  control = mycontrols
+)
+summary(tab1, title = "Summary Statistics Housing Data")
+```
+
+
+```{r fig.cap="R Functions and Scripts to Create the Final Data Set"}
+grViz(
+  "digraph flowchart {
+      # node definitions with substituted label text
+      node [fontname = Helvetica, shape = rectangle]
+      tab1 [label = '@@1', fontsize = 60]
+      tab2 [label = '@@2', fontsize = 60]
+      tab3 [label = '@@3', fontsize = 60]
+      tab4 [label = '@@4', fontsize = 60]
+      tab5 [label = '@@5', fontsize = 60]
+      tab6 [label = '@@6', fontsize = 60]
+      
+      ranksep = 2;
+
+      # edge definitions with the node IDs
+      tab1 -> tab2;
+      tab2 -> tab3;
+      tab2 -> tab4;
+      tab4 -> tab5;
+      tab4 -> tab6;
+      }
+
+      [1]: 'scrape_all.R includes all web scraping functions'
+      [2]: 'add_lat_lng_script.R combines all files for each website separately and does some data cleaning.'
+      [3]: 'The script uses the function in insert_lat_lng_maps_api.R \\n to add  latitude and longitude values and then new folders are created \\n in the add_lat_lng_script.R script with the augmented data.'
+      [4]: '`create_final_df.R` combines all the files with \\n the augmented latitude and longitude values.'
+      [5]: 'It uses data_augemtation_data.R to read in all \\n the places data which reside in data/augmentation_data'
+      [6]: 'It uses the function in add_distance_var_to_df.R \\n to calculate distances and \\n how many places fall inside a certain radius.'
+      "
+)
+```

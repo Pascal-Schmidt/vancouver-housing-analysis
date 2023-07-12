@@ -1,0 +1,450 @@
+---
+title: "STAT 844 Final Project"
+subtitle: "Predicting the Price of Vancouver Property Listings"
+author: "Pascal Schmidt"
+date: "2023-04-17"
+format: 
+  revealjs:
+    theme: [default, theme.scss]
+---
+
+## Research Question {background-image="waterloo.png" transition="slide"}
+
+- The main goal of the analysis was to estimate the market price of a property in Vancouver to inform interested buyers and seller about how much a property is worth.
+- The secondary goal was to investigate which variables are affecting the price of a property the most and what is the relationship between price and predictor variables.
+- To achieve this goal, property listing prices were collected and the listing prices was used as a metric to estimate the market price of a property.
+
+## Data Collection {background-image="waterloo.png" transition="slide" .smaller}
+
+:::: {.columns}
+::: {.column width="50%"}
+- I scraped data from four different real estate website.
+- The time frame for the data collection process was between late January until late March.
+- The main tools used for scraping listings were `rvest`, `RSelenium` and a Docker container.
+- The Docker container was necessary to ensure a stable environment with the `RSelenium` package. 
+:::
+
+::: {.column width="50%"}
+```{r}
+library(tidyverse)
+library(knitr)
+library(tidymodels)
+library(sf)
+library(DiagrammeR)
+library(corrplot)
+library(ggmap)
+library(vip)
+library(mgcv)
+library(earth)
+library(caret)
+library(pdp)
+
+set.seed(1234)
+
+dplyr::tibble(
+  `Property Listing Websites` = c("Point 2 Homes", "Remax", "Rew", "Zolo")
+) %>%
+  dplyr::mutate(
+    `Property Listing Websites` = dplyr::case_when(
+      `Property Listing Websites` == "Point 2 Homes" ~ paste0(
+        "[", `Property Listing Websites`, "]", "(https://www.point2homes.com/CA/Real-Estate-Listings/BC/Vancouver.html)"
+      ),
+      `Property Listing Websites` == "Remax" ~ paste0(
+        "[", `Property Listing Websites`, "]", "(https://www.remax.ca/bc/vancouver-real-estate?pageNumber=1)"
+      ),
+      `Property Listing Websites` == "Rew" ~ paste0(
+        "[", `Property Listing Websites`, "]", "(https://www.rew.ca/properties/areas/vancouver-bc)"
+      ),
+      `Property Listing Websites` == "Zolo" ~ paste0(
+        "[", `Property Listing Websites`, "]", "(https://www.zolo.ca/vancouver-real-estate)"
+      )
+    )
+  ) %>%
+  knitr::kable(align = "c")
+```
+
+```{r}
+dplyr::tibble(
+  `Variables From Web Scraping` = c(
+    "Price", "Number of Bedrooms", "Number of Bathrooms", "Number of Square Feet",
+    "Lot Size in Square Feet", "Address", "Type of Home"
+  )
+) %>% knitr::kable(align = "c")
+```
+
+:::
+::::
+
+## Data Collection {background-image="waterloo.png" transition="slide" .smaller}
+
+- On top of the predictors acquired from scraping real estate websites, I also augmented the data set with variables that can potentially explain the variation in property prices well.
+
+::: {.incremental}
+- Added latitude and longitude data with the [Google Maps API]((https://cloud.google.com/products))
+- Added the nearest distance from a property to a public place such as [schools](https://opendata.vancouver.ca/explore/dataset/schools/table/) and [parks](https://opendata.vancouver.ca/explore/dataset/parks-polygon-representation/table/) and also the nearest distance to a [sky train station and bus stop](https://www.translink.ca/about-us/doing-business-with-translink/app-developer-resources/gtfs/gtfs-data). 
+- I also calculated the number of [commercial services, convenience stores, and restaurants and bars](https://opendata.vancouver.ca/explore/dataset/storefronts-inventory/table/) within a 500 meter radius from the property. 
+- I added the Vancouver neighborhoods to the data set with the help of a shape file from the [open data portal](https://opendata.vancouver.ca/explore/dataset/local-area-boundary/table/?disjunctive.name).
+- Lastly, I added the number of different [crimes](https://geodash.vpd.ca/opendata/) occurring in a neighborhood. 
+- In total I collected around 4,000 observations and 25 variables.
+:::
+
+## All Predictors {background-image="waterloo.png" transition="slide"}
+
+```{r}
+font.size <- "12pt"
+
+dplyr::tibble(
+  `Variables From Web Scraping` = c(
+    "Price", "# of Bedrooms", "# of Bathrooms", "# of Square Feet",
+    "Lot Size in Square Feet", "Latitude", "Longitude", "Closest School (in meters)",
+    "Closest Park (in meters)", "Closest Bus Stop (in meters)",
+    "Closest Sky Train Station (in meters)", "# of Restaurants/Coffee Shops within 500 meters",
+    "# of Commercial Services within 500 meters", "# of Convenience Stores within 500 meters",
+    "# of Break and Enter Commercial \n within neighborhood",
+    "# of Break and Enter Residential/Other \n within neighborhood",
+    "# of Mischief within neighborhood", "Other Theft within neighborhood",
+    "Theft from Vehicle within neighborhood", "Theft of Bicycle within neighborhood",
+    "Theft of Vehicle within neighborhood",
+    "Vehicle Collision or Pedestrian Struck (with Injury) \n within neighborhood",
+    "Type of Home", "Neighborhood", "Websites"
+  ),
+  Mode = c(rep("Continuous", 22), "Categorical", "Categorical", "Categorical")
+) %>% 
+   DT::datatable(
+     height = "800px",
+     options=list(
+       initComplete = htmlwidgets::JS(
+          "function(settings, json) {",
+          paste0("$(this.api().table().container()).css({'font-size': '", font.size, "'});"),
+          "}")
+       ) 
+     )
+```
+
+## Sample Size {background-image="waterloo.png" transition="slide" visibility="hidden" }
+
+```{r}
+grViz(
+  "digraph flowchart {
+      # node definitions with substituted label text
+      node [fontname = Helvetica, shape = rectangle]
+      tab1 [label = '@@1']
+      tab2 [label = '@@2']
+      tab3 [label = '@@3']
+      tab4 [label = '@@4']
+      tab5 [label = '@@5']
+      tab6 [label = '@@6']
+
+      # edge definitions with the node IDs
+      tab1 -> tab2;
+      tab2 -> tab3;
+      tab3 -> tab4;
+      tab4 -> tab5;
+      tab4 -> tab6;
+      }
+
+      [1]: 'Scraped homes from the Greater Vancouver real estate market from 6 websites n = ~20,000'
+      [2]: 'Augmented data with the Google Maps API and removed missing lat lon values n = ~18,200'
+      [3]: 'Removed rows with missing values for predictors n = ~14,000'
+      [4]: 'Only included observation that are located in the Vancouver neighborhoods and are below $10 Million n = ~7,000'
+      [5]: 'Rental Sample n = ~3,000'
+      [6]: 'Home Sample n = ~4,000'
+      "
+)
+```
+
+## Website Bias {background-image="waterloo.png" transition="slide" visibility="hidden" }
+
+```{r}
+config <- config::get()
+# Set your API Key
+ggmap::register_google(key = config$maps_api_key)
+
+df <- readr::read_csv(
+  here::here(
+    "data/analysis/df.csv"
+  )
+)
+
+df <- df %>%
+  dplyr::filter(
+    rent_buy == "buy", !is.na(type), type != "2 BedsBds",
+    type != "Triplex" & type != "Other",
+    square_feet >= 300, price <= 10000000
+  ) %>%
+  dplyr::mutate(
+    type = ifelse(type == "House with Acreage", "House", type)
+  ) %>%
+  dplyr::select(
+    square_feet, price, beds, baths, type, lot_size, neighborhood,
+    lng, lat, sky_train, bus_stop, parks, schools, commercial_services,
+    food_beverages, food_beverages, website,
+    break_and_enter_commercial:vehicle_collision_or_pedestrian_struck_with_injury
+  )
+
+df %>%
+  dplyr::filter(type %in% c("Townhouse", "Apartment", "Duplex", "House")) %>%
+  ggplot(aes(x = type, y = price, fill = website)) +
+  geom_boxplot(alpha = 0.4) +
+  scale_y_log10(label = scales::dollar_format()) +
+  theme_minimal() +
+  theme(legend.position = "bottom") +
+  labs(
+    title = "Price by Home Type and Website",
+    subtitle = "Is there any bias in home prices on different websites?",
+    fill = "Websites"
+  ) +
+  ylab("") +
+  xlab("")
+```
+
+## Property Prices By Type {background-image="waterloo.png" transition="slide"}
+
+```{r fig.width = 14, fig.height = 7, fig.align='center'}
+p <- ggmap(
+  get_googlemap(
+    center = c(lon = -123.11, lat = 49.25),
+    zoom = 12, scale = 2,
+    maptype = "terrain",
+    color = "color"
+  )
+)
+
+p + geom_point(
+  data = df,
+  aes(x = lng, y = lat, col = price),
+  alpha = 0.4, size = 3
+) +
+  facet_wrap(~type) +
+  theme_minimal() +
+  theme(
+    legend.position = "bottom",
+    legend.key.width = unit(4, "cm"),
+    axis.text = element_text(size = 12),
+    axis.title = element_text(size = 14),
+    legend.text = element_text(size = 14),
+    legend.title = element_text(size = 16),
+    strip.text.x = element_text(size = 12)
+  ) +
+  scale_colour_gradientn(colours = terrain.colors(10)) +
+  scale_x_continuous(labels = scales::label_number(accuracy = 0.01)) +
+  labs(color = "Home Price") +
+  xlab("Longitude") +
+  ylab("Latitude")
+```
+
+## Correlations {background-image="waterloo.png" transition="slide"}
+
+```{r}
+df %>%
+  dplyr::select_if(is.numeric) %>%
+  cor() %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column(var = "variables") %>%
+  dplyr::filter(variables == "price") %>%
+  dplyr::select(-price) %>%
+  purrr::set_names(
+    c(
+      "Price", "Square Feet", "Beds", "Baths", "Lot Size", "Longitude", "Latitude",
+      "Sky Train", "Bus Stop", "Parks", "Schools", "Commercial Services",
+      "Restaurants & Bars", "Commercial Crimes", "Residential Crimes", "Mischief",
+      "Other Theft", "Vehicle Theft", "Bicycle Theft", "Theft of Vehicle", "Road Accidents"
+    )
+  ) %>%
+  tibble::column_to_rownames(var = "Price") -> temp
+
+par(mfrow = c(1, 2))
+corrplot::corrplot(
+  t(as.matrix(temp[, 1:10])),
+  method = "number",
+  cl.pos = "n", tl.col = "black", number.cex = .7
+)
+corrplot::corrplot(
+  t(as.matrix(temp[, 11:length(temp)])),
+  method = "number", cl.pos = "n", tl.col = "black", number.cex = .7
+)
+```
+
+## Correlations {background-image="waterloo.png" transition="slide"}
+
+```{r}
+p1 <- df %>%
+  ggplot(aes(x = sky_train, y = price)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth() +
+  scale_y_log10(label = scales::dollar_format()) +
+  facet_wrap(~type) +
+  theme_minimal() +
+  ylab("Price") +
+  xlab("Sky Train Distance in Meters")
+
+p2 <- df %>%
+  dplyr::arrange(price) %>%
+  ggplot(aes(x = square_feet, y = price)) +
+  geom_point(alpha = 0.5) +
+  theme_minimal() +
+  scale_y_continuous(label = scales::dollar_format()) +
+  scale_x_continuous(label = scales::number_format()) +
+  geom_smooth(se = F) +
+  ggtitle("") +
+  xlab("Square Feet") +
+  ylab("Price") +
+  theme(legend.position = "bottom")
+
+grid.arrange(p1, p2, ncol = 2)
+```
+
+## Interactions {background-image="waterloo.png" transition="slide" visibility="hidden" }
+
+```{r}
+par(
+  mfrow = c(2, 2), # 2x2 layout
+  oma = c(2, 2, 0, 0), # two rows of text at the outer left and bottom margin
+  mar = c(1, 1, 0, 0), # space for one row of text at ticks and to separate plots
+  mgp = c(2, 1, 0), # axis label at 2 rows distance, tick labels at 1 row
+  xpd = NA
+)
+vis.gam(gam(data = df, price ~ te(square_feet, lng)), theta = -10, phi = 20)
+vis.gam(gam(data = df, price ~ te(sky_train, lot_size)), theta = 20, phi = 20)
+vis.gam(gam(data = df, price ~ te(lat, lot_size)), theta = 60, phi = 20)
+vis.gam(gam(data = df, price ~ te(sky_train, commercial_services)),  theta = -75, phi = 20)
+```
+
+## Model Fitting {background-image="waterloo.png" transition="slide"}
+
+- The data was randomly split into 80% of training data and 20% of testing data. 
+- The 80% of training data was further split into 10 fold-cross validation to tune different hyperparameters for a random forest model and a gradient boosted tree model.
+- For each of the two models an initial set of hyperparameters was selected and then tuned a second time based on certain ranges of hyperparameters where the model performed well. 
+
+## Results {background-image="waterloo.png" transition="slide"}
+
+```{r}
+# random forest
+cv_metrics_rf <- readr::read_rds(here::here("data/models/cv_metrics_rf.rds"))
+final_rf <- readr::read_rds(here::here("data/models/final_rf.rds"))
+testing_metrics_rf <- final_rf$.metrics
+
+# xgb
+cv_metrics_xgb <- readr::read_rds(here::here("data/models/cv_metrics_xgb.rds"))
+final_xgb <- readr::read_rds(here::here("data/models/final_xgb.rds"))
+testing_metrics_xgb <- final_xgb$.metrics
+
+rf <- cor(final_rf$.predictions[[1]]$price, final_rf$.predictions[[1]]$.pred) %>% round(3)
+xgb <- cor(final_xgb$.predictions[[1]]$price, final_xgb$.predictions[[1]]$.pred) %>% round(3)
+label_plot <- dplyr::tibble(
+  Model = c("Random Forest", "XG Boost"),
+  Correlation = c(rf, xgb) %>% paste("r = ", .)
+)
+
+final_rf$.predictions[[1]] %>%
+  dplyr::mutate(Model = "Random Forest") %>%
+  dplyr::bind_rows(
+    final_xgb$.predictions[[1]] %>%
+      dplyr::mutate(Model = "XG Boost")
+  ) %>%
+  ggplot(aes(x = .pred, y = price)) +
+  geom_point(alpha = 0.6) +
+  geom_abline(slope = 1, color = "steelblue") +
+  facet_wrap(~Model) +
+  theme_minimal() +
+  ylab("Actual Price") +
+  xlab("Prediction") +
+  geom_text(
+    data = label_plot,
+    aes(
+      x = 2000000, y = 7000000,
+      label = Correlation
+    ), size = 4
+  ) +
+  scale_y_continuous(
+    breaks = seq(0, 8000000, 2000000),
+    label = scales::dollar_format()
+  ) +
+  scale_x_continuous(
+    breaks = seq(0, 8000000, 2000000),
+    label = scales::dollar_format(),
+    guide = guide_axis(angle = -45)
+  ) 
+```
+
+## Results {background-image="waterloo.png" transition="slide"}
+
+```{r}
+# utility function to improve layout of tables
+format_table_numbers <- function(table, column_name, column_value) {
+  table %>%
+    dplyr::mutate(
+      !!column_value := dplyr::case_when(
+        !!sym(column_name) %in% c("rmse", "mae") ~ scales::dollar(!!sym(column_value)),
+        !!sym(column_name) == "rsq" ~ scales::percent(!!sym(column_value), accuracy = 0.01),
+        !!sym(column_name) == "mape" ~ scales::percent(round(!!sym(column_value) / 100, 4), accuracy = 0.01)
+      )
+    )
+}
+
+cv_metrics_rf %>%
+  dplyr::select(.metric, mean) %>%
+  dplyr::mutate(Model = "Random Forest") %>%
+  dplyr::bind_rows(
+    cv_metrics_xgb %>%
+      dplyr::select(.metric, mean) %>%
+      dplyr::mutate(Model = "XG Boost")
+  ) %>%
+  format_table_numbers(column_name = ".metric", column_value = "mean") %>%
+  tidyr::pivot_wider(
+    names_from = .metric,
+    values_from = mean
+  ) %>%
+  purrr::set_names(c("Model", "MAE", "MAPE", "RMSE", "R-SQUARED")) %>%
+  dplyr::mutate_if(is.numeric, ~ round(., 3)) %>%
+  dplyr::mutate(
+    Results = "Cross-Validation"
+  ) -> cv_table
+
+testing_metrics_rf[[1]] %>%
+  dplyr::mutate(Model = "Random Forest") %>%
+  dplyr::bind_rows(
+    testing_metrics_xgb[[1]] %>%
+      dplyr::mutate(Model = "XG Boost")
+  ) %>%
+  format_table_numbers(column_name = ".metric", column_value = ".estimate") %>%
+  tidyr::pivot_wider(names_from = .metric, values_from = .estimate) %>%
+  dplyr::select(Model:mape) %>%
+  dplyr::select(Model, mae, mape, rmse, rsq) %>%
+  purrr::set_names(
+    c(
+      "Model", "MAE", "MAPE", "RMSE", "R-SQUARED"
+    )
+  ) %>%
+  dplyr::mutate(
+    Results = "Testing Data"
+  ) %>%
+  dplyr::bind_rows(
+    ., cv_table
+  ) %>%
+  knitr::kable(
+    caption = "Model Results Of Cross-Validation and Testing Data Sets",
+    booktabs = TRUE
+  ) %>% 
+  kableExtra::kable_styling(
+    font_size = 26,
+    bootstrap_options = c("striped", "hover")
+  )
+```
+
+## Variable Importance {background-image="waterloo.png" transition="slide"}
+
+```{r}
+library(png)
+library(grid)
+library(gridExtra)
+vip_rf <- png::readPNG("VI_RF.png")
+vip_xgb <- png::readPNG("VI_XGB.png")
+
+grid.arrange(rasterGrob(vip_rf), rasterGrob(vip_xgb), ncol = 2)
+```
+
+## Conclusions {background-image="waterloo.png" transition="slide"}
+
+- The gradient boosted decision tree does slightly better than the random forest but takes more time to compute due to more hyperparameters.
+- The model is doing well predicting real estate prices and can be used by interested buyers and seller in the Vancouver real estate market to understand, for how much they can list a property. 
